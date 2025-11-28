@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
+import base64
+
 
 # Try importing Pathway (Linux/WSL required)
 try:
@@ -246,54 +248,48 @@ def get_github_headers():
         'Accept': 'application/vnd.github.v3+json'
     }
 
-def extract_pr_data(repo: str, pr_number: int) -> PullSharkState:
-    print(f"\n📥 [1/5] Fetching PR Data for {repo}#{pr_number}...")
-    
-    # Demo Mode Fallback
-    if TEST_MODE or not GITHUB_TOKEN:
-        print("   ⚠️ Test Mode or No Token: Using Mock Data")
-        return {
-            'pr_number': pr_number,
-            'pr_title': 'Feat: Add Stripe Payment Processing',
-            'pr_description': 'Implements stripe charge logic and token validation.',
-            'author': 'dev_user',
-            'repo': repo,
-            'diff_content': '+ stripe.Charge.create(amount=100)\n+ if not token: raise Error',
-            'risk_score': 8,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'similar_bugs': [], 'historical_prs': [], 'test_plan': {}, 'formatted_comment': '', 'status': 'pending'
-        }
+def extract_pr_data_from_string(pr_str: str) -> PullSharkState:
+    """
+    Parse the compressed PR string coming from Node backend.
+    Example compressed format:
+        t: title
+        a: author
+        f[10]: file1,file2,...
+        diff: "...."
+    """
 
-    try:
-        # Fetch PR
-        pr_url = f"{GITHUB_API_BASE}/repos/{repo}/pulls/{pr_number}"
-        pr_res = requests.get(pr_url, headers=get_github_headers())
-        pr_res.raise_for_status()
-        pr_data = pr_res.json()
+    lines = pr_str.split("\n")
+    title = ""
+    author = ""
+    files = []
+    diff = ""
 
-        # Fetch Diff
-        diff_url = f"{GITHUB_API_BASE}/repos/{repo}/pulls/{pr_number}.diff"
-        diff_res = requests.get(diff_url, headers=get_github_headers())
-        diff_content = diff_res.text
+    for line in lines:
+        if line.startswith("t:"):
+            title = line.replace("t:", "").strip()
+        elif line.startswith("a:"):
+            author = line.replace("a:", "").strip()
+        elif line.startswith("f["):
+            part = line.split("]:")[1]
+            files = [f.strip() for f in part.split(",")]
+        elif line.startswith("diff:"):
+            diff = line.replace("diff:", "").strip()
 
-        # Simple Risk Calc
-        keywords = ['auth', 'payment', 'security', 'db', 'delete']
-        risk = sum(2 for kw in keywords if kw in pr_data['title'].lower() or kw in diff_content.lower())
-
-        return {
-            'pr_number': pr_data['number'],
-            'pr_title': pr_data['title'],
-            'pr_description': pr_data['body'] or '',
-            'author': pr_data['user']['login'],
-            'repo': repo,
-            'diff_content': diff_content[:2000], 
-            'risk_score': min(risk, 10),
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'similar_bugs': [], 'historical_prs': [], 'test_plan': {}, 'formatted_comment': '', 'status': 'pending'
-        }
-    except Exception as e:
-        print(f"❌ Error fetching GitHub data: {e}")
-        raise
+    return {
+        'pr_number': -1,      # irrelevant now
+        'pr_title': title,
+        'pr_description': "",
+        'author': author,
+        'repo': "",
+        'diff_content': diff,
+        'risk_score': 5,      # or calculate from diff
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'similar_bugs': [],
+        'historical_prs': [],
+        'test_plan': {},
+        'formatted_comment': '',
+        'status': 'pending'
+    }
 
 def augment_context(state: PullSharkState) -> PullSharkState:
     print(f"\n🧠 [2/5] Retrieving Context (RAG)...")
@@ -424,9 +420,8 @@ app.add_middleware(
 # ============================================================================
 
 class AnalyzePRRequest(BaseModel):
-    repo: str
-    pr_number: int
-    post_to_github: bool = False
+    pr: str   # compressed PR string you send
+
 
 class AnalyzePRResponse(BaseModel):
     success: bool
@@ -482,36 +477,28 @@ def health_check():
         test_mode=TEST_MODE
     )
 
-@app.post("/api/analyze", response_model=AnalyzePRResponse, tags=["Analysis"])
+@app.get("/api/analyze", response_model=AnalyzePRResponse)
 async def analyze_pr(request: AnalyzePRRequest, background_tasks: BackgroundTasks):
-    """
-    Analyze a GitHub Pull Request with AI
-    
-    - Fetches PR data from GitHub
-    - Performs semantic search for similar bugs
-    - Generates test plan with Gemini
-    - Optionally posts comment to GitHub
-    - Saves results to database
-    """
+
     try:
-        print(f"🦈 Starting PullShark on {request.repo} PR #{request.pr_number}")
-        
-        # Execute workflow
-        state = extract_pr_data(request.repo, request.pr_number)
+        print("🦈 PR RECEIVED FROM NODE BACKEND")
+
+        # No GitHub fetching
+        decoded = base64.b64decode(request.pr).decode("utf-8")
+        state = extract_pr_data_from_string(decoded)
+
+        # RAG + LLM
         state = augment_context(state)
         state = generate_test_plan(state)
-        
-        # Post comment if requested
-        if request.post_to_github:
-            state = post_comment(state)
-        else:
-            # Just format the comment without posting
-            plan = state.get('test_plan', {})
-            if 'error' not in plan:
-                priority_emoji = "🔴" if plan.get('priority') == 'High' else "🟡"
-                comment = f"""## 🦈 PullShark AI Analysis
-    
-**Risk Level**: {priority_emoji} {plan.get('priority', 'Unknown')}
+
+        # Build comment for Node backend to post
+        plan = state["test_plan"]
+        if "error" not in plan:
+            priority_emoji = "🔴" if plan.get('priority') == 'High' else "🟡"
+            state["formatted_comment"] = f"""
+## 🦈 PullShark AI Analysis
+
+**Risk Level**: {priority_emoji} {plan.get('priority')}
 
 ### 🧪 Recommended Tests
 {chr(10).join(f"- [ ] {t}" for t in plan.get('recommended_tests', []))}
@@ -520,29 +507,24 @@ async def analyze_pr(request: AnalyzePRRequest, background_tasks: BackgroundTask
 {chr(10).join(f"- {t}" for t in plan.get('edge_cases', []) + plan.get('security_risks', []))}
 
 ---
-*Generated by PullShark using Gemini & Pathway*
-                """
-                state['formatted_comment'] = comment
-        
-        # Save results in background
-        background_tasks.add_task(save_results, state)
-        
+*Generated by PullShark AI*
+            """
+
         return AnalyzePRResponse(
             success=True,
-            pr_number=state['pr_number'],
-            repo=state['repo'],
-            author=state['author'],
-            risk_score=state['risk_score'],
-            status=state['status'],
-            test_plan=state['test_plan'],
-            formatted_comment=state['formatted_comment'],
-            similar_bugs=state['similar_bugs'],
-            timestamp=state['timestamp']
+            pr_number=-1,
+            repo="unknown",
+            author=state["author"],
+            risk_score=state["risk_score"],
+            status=state["status"],
+            test_plan=state["test_plan"],
+            formatted_comment=state["formatted_comment"],
+            similar_bugs=state["similar_bugs"],
+            timestamp=state["timestamp"]
         )
-        
+
     except Exception as e:
-        print(f"❌ Critical Failure: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
 
 @app.get("/api/history", response_model=HistoryResponse, tags=["History"])
 def get_analysis_history(limit: int = 50):
