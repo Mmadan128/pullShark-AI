@@ -477,7 +477,7 @@ def health_check():
         test_mode=TEST_MODE
     )
 
-@app.get("/api/analyze", response_model=AnalyzePRResponse)
+@app.post("/api/analyze", response_model=AnalyzePRResponse)
 async def analyze_pr(request: AnalyzePRRequest, background_tasks: BackgroundTasks):
 
     try:
